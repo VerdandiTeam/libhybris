@@ -15,6 +15,7 @@ Summary:   Utilize Bionic-based HW adaptations on glibc systems
 License:   ASL 2.0 and BSD and ISC and LGPLv2 and MIT
 URL:       https://github.com/mer-hybris/libhybris
 Source:    %{name}-%{version}.tar.bz2
+Patch0:    crown.patch
 BuildRequires: libtool
 BuildRequires: pkgconfig(wayland-client)
 BuildRequires: vulkan-headers
@@ -284,7 +285,12 @@ Requires:  %{name} = %{version}-%{release}
 %{summary}.
 
 %prep
-%autosetup -n %{name}-%{version}/%{name}
+%setup -q -n %{name}-%{version}/%{name}
+if patch -p1 -R -s -f --dry-run < %{PATCH0} >/dev/null 2>&1; then
+  echo "crown.patch already applied, skipping"
+else
+  patch -p1 -s < %{PATCH0}
+fi
 
 %build
 cd hybris

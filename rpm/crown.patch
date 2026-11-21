@@ -1,0 +1,146 @@
+diff --git a/hybris/common/hooks.c b/hybris/common/hooks.c
+index 67bbf31..cbcc490 100644
+--- a/hybris/common/hooks.c
++++ b/hybris/common/hooks.c
+@@ -328,11 +328,91 @@ static pthread_rwlock_t* hybris_alloc_init_rwlock(void)
+  *
+  * */
+ 
++/*
++ * On 32-bit ARM glibc only guarantees 8 byte aligned allocations, while
++ * bionic hands out 16 byte aligned blocks for sizes of 16 and up. Android
++ * blobs built with clang emit NEON loads/stores with :128 alignment hints
++ * on heap memory and die with SIGBUS (BUS_ADRALN) on an 8 byte aligned
++ * pointer, so give bionic code 16 byte aligned memory like bionic does.
++ */
++#if defined(__arm__)
++#define HYBRIS_HEAP_ALIGN 16
++#endif
++
+ static void *_hybris_hook_malloc(size_t size)
+ {
+     TRACE_HOOK("size %zu", size);
+ 
++#ifdef HYBRIS_HEAP_ALIGN
++    void *res = size >= HYBRIS_HEAP_ALIGN ? memalign(HYBRIS_HEAP_ALIGN, size) : malloc(size);
++#else
+     void *res = malloc(size);
++#endif
++
++    TRACE_HOOK("res %p", res);
++
++    return res;
++}
++
++static void *_hybris_hook_memalign(size_t alignment, size_t size)
++{
++    TRACE_HOOK("alignment %zu size %zu", alignment, size);
++
++#ifdef HYBRIS_HEAP_ALIGN
++    if (size >= HYBRIS_HEAP_ALIGN && alignment < HYBRIS_HEAP_ALIGN)
++        alignment = HYBRIS_HEAP_ALIGN;
++#endif
++
++    void *res = memalign(alignment, size);
++
++    TRACE_HOOK("res %p", res);
++
++    return res;
++}
++
++static void *_hybris_hook_calloc(size_t nmemb, size_t size)
++{
++    TRACE_HOOK("nmemb %zu size %zu", nmemb, size);
++
++    void *res;
++#ifdef HYBRIS_HEAP_ALIGN
++    size_t total;
++
++    if (__builtin_mul_overflow(nmemb, size, &total)) {
++        errno = ENOMEM;
++        res = NULL;
++    } else if (total >= HYBRIS_HEAP_ALIGN) {
++        res = memalign(HYBRIS_HEAP_ALIGN, total);
++        if (res)
++            memset(res, 0, total);
++    } else {
++        res = calloc(nmemb, size);
++    }
++#else
++    res = calloc(nmemb, size);
++#endif
++
++    TRACE_HOOK("res %p", res);
++
++    return res;
++}
++
++static void *_hybris_hook_realloc(void *ptr, size_t size)
++{
++    TRACE_HOOK("ptr %p size %zu", ptr, size);
++
++    void *res = realloc(ptr, size);
++
++#ifdef HYBRIS_HEAP_ALIGN
++    if (res && size >= HYBRIS_HEAP_ALIGN && ((uintptr_t) res & (HYBRIS_HEAP_ALIGN - 1))) {
++        void *aligned = memalign(HYBRIS_HEAP_ALIGN, size);
++        if (aligned) {
++            memcpy(aligned, res, size);
++            free(res);
++            res = aligned;
++        }
++    }
++#endif
+ 
+     TRACE_HOOK("res %p", res);
+ 
+@@ -343,6 +423,12 @@ static void *_hybris_hook_aligned_alloc(size_t alignment, size_t size)
+ {
+     TRACE_HOOK("alignment %zu size %zu", alignment, size);
+ 
++#ifdef HYBRIS_HEAP_ALIGN
++    if (size >= HYBRIS_HEAP_ALIGN && alignment && alignment < HYBRIS_HEAP_ALIGN
++            && !(alignment & (alignment - 1)))
++        alignment = HYBRIS_HEAP_ALIGN;
++#endif
++
+     void *res = aligned_alloc(alignment, size);
+ 
+     TRACE_HOOK("res %p", res);
+@@ -2558,6 +2644,13 @@ static int _hybris_hook_posix_memalign(void **memptr, size_t alignment, size_t s
+ {
+     TRACE_HOOK("memptr %p alignment %zu size %zu", memptr, alignment, size);
+ 
++#ifdef HYBRIS_HEAP_ALIGN
++    /* glibc treats alignments up to 8 as plain malloc, bionic does not */
++    if (size >= HYBRIS_HEAP_ALIGN && alignment < HYBRIS_HEAP_ALIGN
++            && alignment >= sizeof(void *) && !(alignment & (alignment - 1)))
++        alignment = HYBRIS_HEAP_ALIGN;
++#endif
++
+     return posix_memalign(memptr, alignment, size);
+ }
+ 
+@@ -2980,10 +3073,10 @@ static struct _hook hooks_common[] = {
+     HOOK_INDIRECT(malloc),
+     HOOK_INDIRECT(aligned_alloc),
+     HOOK_INDIRECT(free),
+-    HOOK_DIRECT_NO_DEBUG(calloc),
++    HOOK_INDIRECT(calloc),
+     HOOK_DIRECT_NO_DEBUG(free),
+-    HOOK_DIRECT_NO_DEBUG(realloc),
+-    HOOK_DIRECT_NO_DEBUG(memalign),
++    HOOK_INDIRECT(realloc),
++    HOOK_INDIRECT(memalign),
+     HOOK_DIRECT_NO_DEBUG(valloc),
+     HOOK_DIRECT_NO_DEBUG(pvalloc),
+     HOOK_DIRECT(fread),
+@@ -3288,7 +3381,7 @@ static struct _hook hooks_mm[] = {
+     HOOK_DIRECT_NO_DEBUG(dprintf),
+     HOOK_DIRECT_NO_DEBUG(mallinfo),
+     HOOK_DIRECT(malloc_usable_size),
+-    HOOK_DIRECT(posix_memalign),
++    HOOK_INDIRECT(posix_memalign),
+     HOOK_DIRECT(mprotect),
+     HOOK_TO(__gnu_strerror_r, _hybris_hook__gnu_strerror_r),
+     HOOK_INDIRECT(pthread_rwlockattr_getkind_np),
