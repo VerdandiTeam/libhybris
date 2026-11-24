@@ -7,8 +7,13 @@ tlsdesc_resolver_dynamic dereferenced 0x3000 and crashed, and the linker
 also overwrote that variable. Seen as test_egl_configs and
 lipstick-security-ui segfaulting on an Android 15 based device.
 
-Keep the DTV pointer in the last word of the linker's own initial-exec
-hybris_tls_storage instead and keep the TLSDESC fast path.
+Keep the DTV pointer in the last word of the linker's own
+hybris_tls_storage instead. Do not use initial-exec TLS for it: q.so is
+often dlopen()ed late (boosted lipstick-security-ui) and glibc's static
+TLS surplus is then too small ("cannot allocate memory in static TLS
+block"). Because that TLS has no fixed TP offset, tlsdesc_resolver_dynamic
+now always goes to the slow-path wrapper; hybris_linker_tls_get_addr still
+has its own C fast path.
 
 ---
 diff --git a/hybris/common/q/bionic/libc/bionic/bionic_elf_tls.cpp b/hybris/common/q/bionic/libc/bionic/bionic_elf_tls.cpp
@@ -66,16 +71,18 @@ index d0b7ee8..d9e17a4 100644
  
  // Invokes all the registered thread_exit callbacks, if any.
 diff --git a/hybris/common/q/bionic/libc/bionic/pthread_internal.h b/hybris/common/q/bionic/libc/bionic/pthread_internal.h
-index fe315eb..8c05422 100644
+index fe315eb..3dfab18 100644
 --- a/hybris/common/q/bionic/libc/bionic/pthread_internal.h
 +++ b/hybris/common/q/bionic/libc/bionic/pthread_internal.h
-@@ -182,13 +182,20 @@ static inline  bionic_tls& __get_bionic_tls() {
+@@ -182,13 +182,22 @@ static inline  bionic_tls& __get_bionic_tls() {
    return *static_cast<bionic_tls*>(__get_tls()[TLS_SLOT_BIONIC_TLS]);
  }
  
 -static inline  TlsDtv* __get_tcb_dtv(bionic_tcb* tcb) {
 -  uintptr_t dtv_slot = reinterpret_cast<uintptr_t>(tcb->tls_slot(TLS_SLOT_DTV));
-+extern "C" __attribute__((tls_model ("initial-exec"))) __thread void* hybris_tls_storage[HYBRIS_TLS_STORAGE_SLOTS];
++// No initial-exec here: that would force q.so into glibc static TLS, which is
++// exhausted when q.so is dlopen()ed late (e.g. in boosted lipstick-security-ui).
++extern "C" __thread void* hybris_tls_storage[HYBRIS_TLS_STORAGE_SLOTS];
 +
 +// hybris: see HYBRIS_TLS_DTV_SLOT; tcb->tls_slot(TLS_SLOT_DTV) is not ours.
 +static inline void*& __hybris_dtv_slot() {
@@ -119,7 +126,7 @@ index 1b6242c..96c12fa 100644
    size_t offset_ = 0;
 diff --git a/hybris/common/q/bionic/libc/private/hybris_tls.h b/hybris/common/q/bionic/libc/private/hybris_tls.h
 new file mode 100644
-index 0000000..8b538d0
+index 0000000..5f8af43
 --- /dev/null
 +++ b/hybris/common/q/bionic/libc/private/hybris_tls.h
 @@ -0,0 +1,34 @@
@@ -152,13 +159,13 @@ index 0000000..8b538d0
 +// linker overwrite that variable with its DTV pointer.
 +//
 +// Keep the bionic DTV pointer in the last word of the linker's own
-+// initial-exec hybris_tls_storage instead. It is zero for every new thread and
-+// its offset from the thread pointer is the same in all threads, so the
-+// TLSDESC fast path can still load it with a single GOT-relative access.
++// hybris_tls_storage instead. It is zero for every new thread. Do not make it
++// initial-exec: q.so is often dlopen()ed late and glibc's static TLS surplus
++// is then too small for it ("cannot allocate memory in static TLS block").
 +#define HYBRIS_TLS_STORAGE_SLOTS  128
 +#define HYBRIS_TLS_DTV_SLOT       (HYBRIS_TLS_STORAGE_SLOTS - 1)
 diff --git a/hybris/common/q/linker_tls.cpp b/hybris/common/q/linker_tls.cpp
-index 2675a68..77e3873 100644
+index 2675a68..0feb8c3 100644
 --- a/hybris/common/q/linker_tls.cpp
 +++ b/hybris/common/q/linker_tls.cpp
 @@ -42,13 +42,16 @@
@@ -174,40 +181,69 @@ index 2675a68..77e3873 100644
  
 -__attribute__((tls_model ("initial-exec"))) __thread void* hybris_tls_storage[128];
 +extern "C" {
-+__attribute__((tls_model ("initial-exec"))) __thread void* hybris_tls_storage[HYBRIS_TLS_STORAGE_SLOTS];
++__thread void* hybris_tls_storage[HYBRIS_TLS_STORAGE_SLOTS];
 +}
  ssize_t g_hybris_static_tls_tp_offset = 0;
  size_t tls_tp_base = 0;
  
 diff --git a/hybris/common/q/tlsdesc_resolver.S b/hybris/common/q/tlsdesc_resolver.S
-index 96ba135..4363d93 100644
+index 96ba135..462cd4c 100644
 --- a/hybris/common/q/tlsdesc_resolver.S
 +++ b/hybris/common/q/tlsdesc_resolver.S
-@@ -28,6 +28,7 @@
+@@ -40,52 +40,11 @@ ENTRY_PRIVATE(tlsdesc_resolver_static)
+ END(tlsdesc_resolver_static)
  
- #include <platform/bionic/tls_defines.h>
- #include <private/bionic_asm.h>
-+#include <private/hybris_tls.h>
- 
- .globl hybris_linker_tls_get_addr
- 
-@@ -49,12 +50,17 @@ ENTRY_PRIVATE(tlsdesc_resolver_dynamic)
-   .cfi_rel_offset x22, 24
- 
-   mrs x19, tpidr_el0            // __get_tls()
+ ENTRY_PRIVATE(tlsdesc_resolver_dynamic)
+-  stp x19, x20, [sp, #-32]!
+-  .cfi_def_cfa_offset 32
+-  .cfi_rel_offset x19, 0
+-  .cfi_rel_offset x20, 8
+-  stp x21, x22, [sp, #16]
+-  .cfi_rel_offset x21, 16
+-  .cfi_rel_offset x22, 24
+-
+-  mrs x19, tpidr_el0            // __get_tls()
 -  ldr x20, [x19, #(TLS_SLOT_DTV * 8)]
-+  // hybris: DTV lives in hybris_tls_storage[HYBRIS_TLS_DTV_SLOT], not in
-+  // TLS_SLOT_DTV (that word belongs to glibc / another module's TLS).
-+  adrp x20, :gottprel:hybris_tls_storage
-+  ldr x20, [x20, #:gottprel_lo12:hybris_tls_storage]
-+  add x20, x20, #(HYBRIS_TLS_DTV_SLOT * 8)
-+  ldr x20, [x19, x20]
- 
+-
++  // hybris: no inline fast path. The DTV pointer lives in q.so's own TLS
++  // (hybris_tls_storage[HYBRIS_TLS_DTV_SLOT]), which is in glibc dynamic TLS
++  // and has no fixed offset from the thread pointer. The C fast path in
++  // hybris_linker_tls_get_addr does the generation check instead.
    ldr x0, [x0, #8]              // TlsDynamicResolverArg*
-   ldr x22, [x0]                 // TlsDynamicResolverArg::generation
- 
+-  ldr x22, [x0]                 // TlsDynamicResolverArg::generation
+-
 -  cbz x20, .fallback            // hybris: TLS_SLOT_DTV might be uninitialized
-+  cbz x20, .fallback            // hybris: DTV might not be allocated yet
-   ldr x21, [x20]                // TlsDtv::generation
+-  ldr x21, [x20]                // TlsDtv::generation
+-
+-  cmp x21, x22
+-  b.lo .fallback
+-
+-  ldr x21, [x0, #8]             // TlsIndex::module_id
+-  ldr x22, [x0, #16]            // TlsIndex::offset
+-  ldr x21, [x20, x21, lsl #3]   // TlsDtv::modules[module_id]
+-  cbz x21, .fallback
+-  add x0, x21, x22
+-  sub x0, x0, x19
+-
+-  ldp x21, x22, [sp, #16]
+-  .cfi_remember_state
+-  .cfi_restore x21
+-  .cfi_restore x22
+-  ldp x19, x20, [sp], #32
+-  .cfi_adjust_cfa_offset -32
+-  .cfi_restore x19
+-  .cfi_restore x20
+-  ret
+-
+-.fallback:
+-  .cfi_restore_state
+-  ldp x21, x22, [sp, #16]
+-  .cfi_restore x21
+-  .cfi_restore x22
+-  ldp x19, x20, [sp], #32
+-  .cfi_adjust_cfa_offset -32
+-  .cfi_restore x19
+-  .cfi_restore x20
+   b tlsdesc_resolver_dynamic_slow_path
+ END(tlsdesc_resolver_dynamic)
  
-   cmp x21, x22
